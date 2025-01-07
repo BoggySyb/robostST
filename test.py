@@ -22,8 +22,7 @@ from baselines.DSFormer.model import DSFormer
 
 """
 执行命令
-`python main.py --dataset METR-LA  --model_name DSFormer --cudaidx 0`
-`python main.py --mask_ratio 0.4 --dataset METR-LA  --model_name BitGraph --cudaidx 1`
+`python test.py --dataset ETTh1  --model_name DSFormer --cudaidx 0 --mask_ratio 0.0`
 """
 
 
@@ -177,9 +176,9 @@ else:
 ### 模型配置
 model = None
 if args.model_name == "BitGraph":
-    args.epochs = 200
     args.batch_size = 32
-    args.lr = 1e-3
+    args.seq_len = 96
+    args.pred_len = 96
     
     model = BiaTCGNet(True, True, 2, node_number, args.kernel_set,
             device, predefined_A=None,
@@ -192,12 +191,9 @@ if args.model_name == "BitGraph":
             layers=2, propalpha=0.05, tanhalpha=3, layer_norm_affline=True).to(device)
 
 elif args.model_name == "GinAR":
-    args.epochs = 100
     args.batch_size = 16
-    args.lr = 0.006
-    args.gamme = 0.5
-    args.milestone = "1,15,40,70,90"
-    args.max_norm = 5
+    args.seq_len = 96
+    args.pred_len = 96
 
     adj_mx, _ = load_adj("./data/" + args.dataset + "/adj_"  + args.dataset + ".pkl", "doubletransition")
     adj_mx = [torch.tensor(i).float() for i in adj_mx]
@@ -207,11 +203,7 @@ elif args.model_name == "GinAR":
                 layer_num=2, dropout=0.15, adj_mx=adj_mx).to(device)
 
 elif args.model_name == "DSFormer":
-    args.epochs = 100
     args.batch_size = 16
-    args.lr = 0.0001
-    args.gamme = 0.5
-    args.milestone = "25,50,75"
     args.seq_len = 96
     args.pred_len = 96
 
@@ -221,91 +213,60 @@ elif args.model_name == "DSFormer":
 else:
     warnings.warn(f"Wrong model_name: {args.model_name}!!!!!!!")
     sys.exit(1)
-    
-### train lr
-gamme, milestone = args.gamme, []
-if gamme > 0:
-    milestone = [int(x) for x in args.milestone.split(',')]
 
-### train loss
-criteron1 = nn.L1Loss().to(device)
-criteron2 = nn.MSELoss().to(device)
-optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
 ### Log dir
-if args.seed < 0:
-    args.seed = np.random.randint(1e9)
 torch.set_num_threads(1)
-exp_name = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-exp_name = f"{args.mask_ratio}_{exp_name}_{args.seed}"
-logdir = os.path.join('./log_dir', args.dataset, args.model_name, exp_name)
+logdir = os.path.join('./log_dir', args.dataset, args.model_name+"_test")
 # save config for logging
 os.makedirs(logdir, exist_ok=True)
 
-### model path
-# os.makedirs('./output_'+args.model_name+'_'+args.dataset+'_miss'+str(args.mask_ratio)+'_'+args.task, exist_ok=True)
-# state_path = './output_'+args.model_name+'_'+args.dataset+'_miss'+str(args.mask_ratio)+'_'+args.task+'/best.pth'
-
-os.makedirs('./pretrained_'+args.model_name+'_'+args.dataset, exist_ok=True)
 state_path = './pretrained_'+args.model_name+'_'+args.dataset+'/best.pth'
 
 
-def train(model, train_dataloader, val_dataloader, scaler):
+criteron = nn.L1Loss().to(device)
 
-    best_loss=9999999.99
-    k=0
-    for epoch in range(args.epochs):
-        model.train()
-        for i, (x, y) in enumerate(train_dataloader):
-            ### x shape: B,L1,N,D  ### y shape: B,L2,N,D
-            x, y = x.to(device), y.to(device)
-            mask = None
-            if args.model_name == "BitGraph":
-                x_hat = model(x, mask, k)
-            elif args.model_name == "GinAR":
-                x_hat = model(x)
-            elif args.model_name == "DSFormer":
-                x_hat = model(x.squeeze(-1)).unsqueeze(-1)
-
-            trn_loss = 0.35 * criteron1(x_hat, y) + 0.65 * criteron2(x_hat, y)
-            # trn_loss = criteron1(x_hat, y)
-            optimizer.zero_grad()  # optimizer.zero_grad()
-            trn_loss.backward()
-            
-            if args.max_norm > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.max_norm, error_if_nonfinite=True)
-            
-            optimizer.step()
-            if i % 100 == 0:
-                with codecs.open(os.path.join(logdir, 'train.log'), 'a') as fout:
-                    fout.write(f"Epoch {epoch} batch {i}: trn-loss = {trn_loss:.3f}\n")
-
-            if gamme > 0:
-                if (i + 1) in milestone:
-                    for params in optimizer.param_groups:
-                        params['lr'] *= gamme
-                        params["weight_decay"] *= gamme
-
-        val_loss = evaluate(model, val_dataloader, scaler)
-        print(f"Epoch {epoch}, valid-loss = {val_loss:.3f}\n")
-
-        with codecs.open(os.path.join(logdir, 'train.log'), 'a') as fout:
-            fout.write(f"Epoch {epoch}: val_loss = {val_loss:.3f}\n")
-
-        if val_loss < best_loss:
-            best_loss = val_loss
-            best_model = copy.deepcopy(model.state_dict())
-            torch.save(best_model, state_path)
+def MAPE_np(pred, true, mask_value=0):
+    if mask_value != None:
+        mask = np.where(np.abs(true) > (mask_value), True, False)
+        true = true[mask]
+        pred = pred[mask]
+    return np.mean(np.absolute(np.divide((true - pred), (true))))*100
 
 
-def evaluate(model, val_iter, scaler):
+def RMSE_np(pred, true, mask_value=0):
+    if mask_value != None:
+        mask = np.where(np.abs(true) > (mask_value), True, False)
+        true = true[mask]
+        pred = pred[mask]
+    RMSE = np.sqrt(np.mean(np.square(pred-true)))
+    return RMSE
+
+
+def generate_mask(A, mask_ratio):
+    shape = A.shape
+    num_elements = A.numel()
+    num_zeros = int(num_elements * mask_ratio)
+    num_ones = num_elements - num_zeros
+
+    mask = torch.cat([torch.zeros(num_zeros), torch.ones(num_ones)], dim=0)
+    mask = mask[torch.randperm(mask.numel())].reshape(shape).to(A.device)
+
+    return mask
+
+
+def test(model, test_dataloader, scaler):
+    loss = 0.0
+    labels = []
+    preds = []
+
     model.eval()
-    loss=0.0
     k=0
     with torch.no_grad():
-        for i, (x,y) in enumerate(val_iter):
+        for i, (x, y) in enumerate(test_dataloader):
             x, y = x.to(device), y.to(device)
-            mask = None
+            mask = generate_mask(x, args.mask_ratio)
+            x = x * mask
             if args.model_name == "BitGraph":
                 x_hat = model(x, mask, k)
             elif args.model_name == "GinAR":
@@ -313,23 +274,41 @@ def evaluate(model, val_iter, scaler):
             elif args.model_name == "DSFormer":
                 x_hat = model(x.squeeze(-1)).unsqueeze(-1)
 
+            k=k+1
             x_hat = scaler.inverse_transform(x_hat)
             y = scaler.inverse_transform(y)
+            preds.append(x_hat.squeeze())
+            labels.append(y.squeeze())
+            losses = criteron(x_hat, y)
+            loss += losses
 
-            losses = criteron1(x_hat, y)
-            loss+=losses
+        labels = torch.cat(labels, dim=0).cpu().numpy()
+        preds = torch.cat(preds, dim=0).cpu().numpy()
 
+        print('mask loss:', loss / len(test_dataloader))
+        loss = np.mean(np.abs(labels.squeeze() - preds.squeeze()))
+        RMSE = RMSE_np(preds.squeeze(), labels.squeeze())
+        MAPE = MAPE_np(preds.squeeze(), labels.squeeze())
+        
+        loss_str = 'loss,RMSE,MAPE: %.4f & %.4f & %.4f' % (loss, RMSE, MAPE)
+        print(loss_str)
+        with codecs.open(os.path.join(logdir, 'test.log'), 'a') as fout:
+            fout.write(f"mask_ratio = {args.mask_ratio:.1f}\n" + loss_str + '\n')
 
-    return loss/len(val_iter)
+    return loss
 
 
 def run():
 
     print(f"Dataset = {args.dataset}, Seq_len = {args.seq_len}, Pred_len = {args.pred_len}")
-    train_dataloader, val_dataloader, _, scaler = loaddataset(args.seq_len, args.pred_len, args.dataset, args.batch_size)
-
-    ### train
-    train(model, train_dataloader, val_dataloader, scaler)
+    _, _, test_dataloader, scaler = loadnpz(args.dataset, args.batch_size)
+    
+    ### test
+    model.load_state_dict(torch.load(state_path))
+    
+    for i in range(2, 11):
+        args.mask_ratio = i * 0.1
+        test(model, test_dataloader, scaler)
 
 
 if __name__ == '__main__':
